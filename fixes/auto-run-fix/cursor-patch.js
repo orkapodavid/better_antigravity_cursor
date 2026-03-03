@@ -71,20 +71,73 @@ function findCursorPath() {
 const PATCHES = [
     {
         label: 'shouldAutoRun_runEverythingMode',
-        // Match: shouldAutoRun_runEverythingMode(){return NH().isDisabledByAdmin?!1:...}
-        // The method body varies but always starts with the admin check
-        pattern: /shouldAutoRun_runEverythingMode\(\)\{return\s*\w+\(\)\.isDisabledByAdmin\?\!1:[^}]+\}/,
-        replacement: (match) => `shouldAutoRun_runEverythingMode(){return${PATCH_MARKER}!0}`,
+        // Match the entire method body in a version-agnostic way and replace it
+        // with a simple "always true" implementation. This is resilient to
+        // internal refactors as long as the method name stays the same.
+        pattern: /shouldAutoRun_runEverythingMode\(\)\s*\{[^{}]*\}/,
+        replacement: () => `shouldAutoRun_runEverythingMode(){return${PATCH_MARKER}!0}`,
         verify: (content) => content.includes(`shouldAutoRun_runEverythingMode(){return${PATCH_MARKER}!0}`),
     },
     {
         label: 'shouldAutoRun_eitherUseAllowlistOrRunEverythingMode',
-        // Match: shouldAutoRun_eitherUseAllowlistOrRunEverythingMode(){return NH().isDisabledByAdmin?!1:...}
-        pattern: /shouldAutoRun_eitherUseAllowlistOrRunEverythingMode\(\)\{return\s*\w+\(\)\.isDisabledByAdmin\?\!1:[^}]+\}/,
-        replacement: (match) => `shouldAutoRun_eitherUseAllowlistOrRunEverythingMode(){return${PATCH_MARKER}!0}`,
+        // Same idea here: grab the full method and replace it wholesale so
+        // any future logic still gets short‑circuited to "always auto‑run".
+        pattern: /shouldAutoRun_eitherUseAllowlistOrRunEverythingMode\(\)\s*\{[^{}]*\}/,
+        replacement: () => `shouldAutoRun_eitherUseAllowlistOrRunEverythingMode(){return${PATCH_MARKER}!0}`,
         verify: (content) => content.includes(`shouldAutoRun_eitherUseAllowlistOrRunEverythingMode(){return${PATCH_MARKER}!0}`),
     },
+    {
+        label: 'approvalMode_computation',
+        // Force the client-side approval mode to "unrestricted" so that, wherever
+        // possible, the agent behaves as if "Run Everything" were enabled, even
+        // when server or UI defaults would choose allowlist / ask-every-time.
+        // This targets the minified pattern:
+        //   let $;N&&!F?$="unrestricted":P?$="allowlist":(D.length=0,R.length=0,$="ask-every-time");
+        pattern: /let \$;N&&\!F\?\$="unrestricted":P\?\$="allowlist":\(D.length=0,R.length=0,\$="ask-every-time"\);/,
+        replacement: () => `let $="unrestricted";`,
+        verify: (content) => /let \$="unrestricted";/.test(content),
+    },
 ];
+
+// ─── Debug / Introspection Helpers ────────────────────────────────────────────
+
+/**
+ * Extracts snippets around interesting approval-related symbols from
+ * workbench.desktop.main.js into a local file so we can inspect how the
+ * current Cursor build actually wires auto‑run and allowlists.
+ */
+function dumpApprovalSnippets(filePath, outPath) {
+    if (!fs.existsSync(filePath)) {
+        console.log(`  ❌ File not found: ${filePath}`);
+        return;
+    }
+    const content = fs.readFileSync(filePath, 'utf8');
+    const needles = [
+        'shouldAutoRun_runEverythingMode',
+        'shouldAutoRun_eitherUseAllowlistOrRunEverythingMode',
+        'Use Allowlist',
+        'allowlist',
+        'approval',
+        'autoRun'
+    ];
+    const radius = 800;
+    let snippets = '';
+    for (const needle of needles) {
+        let idx = content.indexOf(needle);
+        while (idx !== -1) {
+            const start = Math.max(0, idx - radius);
+            const end = Math.min(content.length, idx + needle.length + radius);
+            snippets += `\n\n==================== ${needle} @ ${idx} ====================\n`;
+            snippets += content.slice(start, end);
+            idx = content.indexOf(needle, idx + needle.length);
+        }
+    }
+    if (!snippets) {
+        snippets = 'No approval-related symbols found with current heuristics.';
+    }
+    fs.writeFileSync(outPath, snippets, 'utf8');
+    console.log(`  📝 Wrote approval snippets to ${outPath}`);
+}
 
 // ─── File Operations ────────────────────────────────────────────────────────
 
@@ -97,16 +150,15 @@ function patchFile(filePath) {
     console.log(`  📄 Reading ${path.basename(filePath)} (${(fs.statSync(filePath).size / 1024 / 1024).toFixed(1)} MB)...`);
     const content = fs.readFileSync(filePath, 'utf8');
 
-    // Check if already patched
-    if (content.includes(PATCH_MARKER)) {
-        console.log(`  ⏭️  Already patched`);
-        return true;
-    }
-
     let patched = content;
     let patchCount = 0;
 
     for (const p of PATCHES) {
+        if (p.verify && p.verify(patched)) {
+            console.log(`  ⏭️  [${p.label}] Already patched`);
+            continue;
+        }
+
         const match = patched.match(p.pattern);
         if (!match) {
             console.log(`  ⚠️  [${p.label}] Pattern not found — may be a different Cursor version`);
@@ -205,7 +257,8 @@ function main() {
     const args = process.argv.slice(2);
     const action = args.includes('--revert') ? 'revert'
         : args.includes('--check') ? 'check'
-            : 'apply';
+            : args.includes('--scan-approvals') ? 'scan-approvals'
+                : 'apply';
 
     console.log('');
     console.log('╔══════════════════════════════════════════════════╗');
@@ -239,6 +292,14 @@ function main() {
         case 'check':
             console.log('🔍 Checking patch status...\n');
             checkFile(workbenchPath);
+            break;
+        case 'scan-approvals':
+            console.log('🔬 Scanning approval/auto-run wiring...\n');
+            dumpApprovalSnippets(
+                workbenchPath,
+                path.join(process.cwd(), 'fixes', 'auto-run-fix', 'workbench-approval-snippets.txt'),
+            );
+            console.log('\n✨ Snippets captured. Open workbench-approval-snippets.txt to inspect.');
             break;
 
         case 'revert':
