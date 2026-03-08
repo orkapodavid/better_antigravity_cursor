@@ -152,10 +152,12 @@ function patchFile(filePath) {
 
     let patched = content;
     let patchCount = 0;
+    let alreadyPatchedCount = 0;
 
     for (const p of PATCHES) {
         if (p.verify && p.verify(patched)) {
             console.log(`  ⏭️  [${p.label}] Already patched`);
+            alreadyPatchedCount++;
             continue;
         }
 
@@ -172,6 +174,11 @@ function patchFile(filePath) {
         patched = patched.replace(match[0], newContent);
         console.log(`     Patched:  ${newContent}`);
         patchCount++;
+    }
+
+    if (patchCount === 0 && alreadyPatchedCount > 0) {
+        console.log(`  ✅ All applicable patches already applied (nothing to do).`);
+        return true;
     }
 
     if (patchCount === 0) {
